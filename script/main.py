@@ -1,72 +1,464 @@
 import cv2
-import math
 import numpy as np
-from ultralytics import YOLO
 import time
+import math
+import os
+import random
+from ultralytics import YOLO
 import tkinter as tk
 from tkinter import messagebox
+import dlib  # For facial landmark detection
+import importlib.util
+
+# ------------------------------
+# FacialSafetyMonitor Class
+# ------------------------------
+class FacialSafetyMonitor:
+    """Monitor facial expressions for signs of strain or discomfort during exercises."""
+    
+    def __init__(self):
+        # Try to load dlib if available
+        self.has_dlib = importlib.util.find_spec("dlib") is not None
+        self.predictor = None
+        self.detector = None
+        
+        # Load models if dlib is available
+        if self.has_dlib:
+            try:
+                self.detector = dlib.get_frontal_face_detector()
+                predictor_path = "shape_predictor_68_face_landmarks.dat"
+                if os.path.exists(predictor_path):
+                    self.predictor = dlib.shape_predictor(predictor_path)
+            except Exception as e:
+                print(f"Error loading facial detection models: {e}")
+                self.has_dlib = False
+        
+        # Current facial expression state
+        self.current_expression = "neutral"
+        self.expression_confidence = 0.0
+        self.expression_start_time = time.time()
+        self.expression_colors = {
+            "struggling": (30, 30, 220),  # Red
+            "serious": (30, 220, 220),    # Yellow
+            "enjoying": (30, 220, 30),    # Green
+            "neutral": (200, 200, 200)    # Light gray
+        }
+        
+        # Expression icons (simple Unicode symbols)
+        self.expression_icons = {
+            "struggling": "😣",  # Persevering face
+            "serious": "😐",     # Neutral face
+            "enjoying": "😊",    # Smiling face
+            "neutral": "😶"      # Face without mouth
+        }
+        
+        # Store expression history
+        self.expression_history = []
+        self.last_feedback_time = time.time()
+        self.feedback_cooldown = 10  # seconds between feedback
+        
+        print("Facial safety monitoring system initialized.")
+        if not self.has_dlib:
+            print("Warning: dlib not available, using fallback detection")
+    
+    def analyze_expression(self, keypoints, frame):
+        """
+        Analyze facial expression using a combination of facial landmarks and pose estimation.
+        Returns detected expression and confidence level.
+        """
+        # Default values
+        expression = "neutral"
+        confidence = 0.5
+        
+        # Primary method: Use dlib facial landmarks if available
+        if self.has_dlib and self.predictor:
+            try:
+                # Convert frame to grayscale for dlib
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                
+                # Use nose position from keypoints to narrow search area
+                nose_x, nose_y = keypoints[0]
+                h, w = frame.shape[:2]
+                
+                # Define face search area around the nose
+                face_search_left = max(0, int(nose_x - w/6))
+                face_search_top = max(0, int(nose_y - h/6))
+                face_search_right = min(w, int(nose_x + w/6))
+                face_search_bottom = min(h, int(nose_y + h/6))
+                
+                # Create a region of interest for face detection
+                roi = gray[face_search_top:face_search_bottom, face_search_left:face_search_right]
+                
+                # Detect faces in the region
+                faces = self.detector(roi)
+                
+                if faces:
+                    # Adjust face rectangle coordinates to the original frame
+                    face_rect = faces[0]
+                    face_rect = dlib.rectangle(
+                        face_rect.left() + face_search_left,
+                        face_rect.top() + face_search_top,
+                        face_rect.right() + face_search_left,
+                        face_rect.bottom() + face_search_top
+                    )
+                    
+                    # Get facial landmarks
+                    landmarks = self.predictor(gray, face_rect)
+                    
+                    # Analyze mouth shape
+                    mouth_width = landmarks.part(54).x - landmarks.part(48).x
+                    mouth_height = (landmarks.part(57).y - landmarks.part(51).y)
+                    mouth_ratio = mouth_height / mouth_width if mouth_width > 0 else 0
+                    
+                    # Analyze eyebrow position
+                    left_eyebrow_y = landmarks.part(24).y
+                    right_eyebrow_y = landmarks.part(19).y
+                    eyebrow_baseline = (landmarks.part(36).y + landmarks.part(45).y) / 2
+                    eyebrow_height = eyebrow_baseline - (left_eyebrow_y + right_eyebrow_y) / 2
+                    
+                    # Determine expression
+                    if mouth_ratio > 0.5 or eyebrow_height < -5:  # Open mouth or furrowed brow
+                        expression = "struggling"
+                        confidence = min(1.0, max(0.7, mouth_ratio * 0.8 + abs(eyebrow_height) * 0.05))
+                    elif mouth_ratio < 0.2 and eyebrow_height > 2:  # Smiling
+                        expression = "enjoying"
+                        confidence = min(1.0, 0.6 + eyebrow_height * 0.05)
+                    elif abs(eyebrow_height) < 2 and mouth_ratio < 0.3:  # Neutral/focused
+                        expression = "serious"
+                        confidence = 0.7
+            except Exception as e:
+                print(f"Error in facial landmark analysis: {e}")
+        
+        # Fallback method: Use pose keypoints for basic expression detection
+        if expression == "neutral" or confidence < 0.6:
+            try:
+                # Check head tilt (can indicate strain)
+                if len(keypoints) >= 5:  # Assuming keypoints include face points
+                    # Get nose, left ear, right ear positions
+                    nose = keypoints[0]
+                    left_ear = keypoints[3]
+                    right_ear = keypoints[4]
+                    
+                    # Calculate head tilt
+                    ear_y_diff = abs(left_ear[1] - right_ear[1])
+                    ear_distance = ((left_ear[0] - right_ear[0])**2 + (left_ear[1] - right_ear[1])**2)**0.5
+                    
+                    if ear_distance > 0:
+                        tilt_ratio = ear_y_diff / ear_distance
+                        
+                        if tilt_ratio > 0.3:  # Significant tilt
+                            expression = "struggling"
+                            confidence = min(1.0, 0.6 + tilt_ratio * 0.8)
+                
+                # Check arm positions (raised arms for lengthy periods can indicate strain)
+                shoulders_y = (keypoints[5][1] + keypoints[6][1]) / 2 if len(keypoints) > 6 else 0
+                arms_raised = False
+                if len(keypoints) > 10:  # If we have arm keypoints
+                    wrists_y = (keypoints[9][1] + keypoints[10][1]) / 2
+                    if wrists_y < shoulders_y - 50:  # Arms are raised
+                        arm_raise_duration = time.time() - self.expression_start_time
+                        if arm_raise_duration > 20 and self.current_expression != "struggling":
+                            expression = "struggling"
+                            confidence = min(1.0, 0.6 + arm_raise_duration * 0.01)
+            except Exception as e:
+                print(f"Error in keypoint-based expression analysis: {e}")
+        
+        # Update expression if confidence is high enough or current is neutral
+        if confidence > 0.65 or self.current_expression == "neutral":
+            if expression != self.current_expression:
+                self.expression_start_time = time.time()
+                self.current_expression = expression
+                self.expression_confidence = confidence
+            elif confidence > self.expression_confidence:  # Update confidence if higher
+                self.expression_confidence = confidence
+        
+        # Add to history
+        timestamp = time.time()
+        self.expression_history.append((timestamp, expression, confidence))
+        
+        # Prune old history
+        self.expression_history = [entry for entry in self.expression_history 
+                                if timestamp - entry[0] < 60]  # Keep last minute
+        
+        return self.current_expression, self.expression_confidence
+    
+    def get_feedback(self, expression):
+        """Generate feedback based on facial expression."""
+        current_time = time.time()
+        
+        # Respect cooldown unless expression is struggling
+        if expression != "struggling" and current_time - self.last_feedback_time < self.feedback_cooldown:
+            return None
+        
+        feedback = None
+        if expression == "struggling":
+            # Feedback for signs of strain or discomfort
+            feedback_options = [
+                "Take a short rest if needed",
+                "Remember to breathe deeply",
+                "Listen to your body",
+                "Go at your own pace",
+                "It's okay to modify the exercise"
+            ]
+            feedback = random.choice(feedback_options)
+            self.last_feedback_time = current_time
+            
+        elif expression == "serious":
+            # Feedback for focused concentration
+            feedback_options = [
+                "Good focus!",
+                "Nice form, keep it up",
+                "You're doing well"
+            ]
+            if random.random() < 0.3:  # Occasional feedback
+                feedback = random.choice(feedback_options)
+                self.last_feedback_time = current_time
+                
+        elif expression == "enjoying":
+            # Positive reinforcement
+            feedback_options = [
+                "Great job!",
+                "Excellent work!",
+                "You're making progress!",
+                "Keep up the good work!"
+            ]
+            if random.random() < 0.5:  # More frequent positive feedback
+                feedback = random.choice(feedback_options)
+                self.last_feedback_time = current_time
+        
+        return feedback
+    
+    def draw_expression_status(self, frame, position=(50, 50)):
+        """Draw current facial expression status with an icon and pulse effect."""
+        try:
+            x, y = position
+            
+            # Get current expression details
+            expression = self.current_expression
+            confidence = self.expression_confidence
+            color = self.expression_colors.get(expression, (200, 200, 200))
+            icon = self.expression_icons.get(expression, "😶")
+            
+            # Create pulsing effect for struggling expression
+            if expression == "struggling":
+                pulse = math.sin(time.time() * 5) * 0.2 + 0.8  # Pulse between 0.6 and 1.0
+                color = tuple(int(c * pulse) for c in color)
+            
+            # Draw expression icon/emoji (using text as placeholder)
+            cv2.putText(frame, icon, (x - 25, y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+            
+            # Draw expression name and confidence
+            status_text = f"{expression.capitalize()}"
+            cv2.putText(frame, status_text, (x, y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+            
+        except Exception as e:
+            print(f"Error drawing expression status: {e}")
 
 # ------------------------------
 # 1) Player Class
 # ------------------------------
 class Player:
     """
-    Represents a player in the game with health points and attack capabilities.
+    Represents a player in the game with health points, attack power, and other attributes.
     """
-    def __init__(self, player_id, max_hp=1000, name="Player"):
+    def __init__(self, player_id, max_hp=1000):
         self.id = player_id
-        self.name = f"{name} {player_id + 1}"
+        self.name = f"Player {player_id + 1}"
         self.max_hp = max_hp
         self.current_hp = max_hp
-        self.attack_ready = False
-        self.attack_power = 0
-        self.last_keypoints = None
-        self.position = (0, 0)  # For displaying player info
-        self.color = (0, 255, 0) if player_id == 0 else (0, 0, 255)  # Green for P1, Red for P2
         
+        # Attack and heal stats
+        self.attack_power = 20
+        self.heal_power = 0
+        self.streak = 0
+        self.streak_multiplier = 1.0
+        
+        # Set player color based on ID
+        if player_id == 0:
+            self.color = (30, 30, 220)  # Red for Player 1 (BGR)
+        else:
+            self.color = (30, 220, 30)  # Green for Player 2 (BGR)
+        
+        # Powerups
+        self.active_powerups = {}
+        
+        # Comeback mechanics to help trailing players
+        self.comeback_bonus = 1.0  # Multiplier for healing/reduced damage
+        
+        # Experience and leveling
+        self.xp = 0
+        self.level = 1
+        self.xp_to_level = 100  # XP needed for first level up
+        
+        # Achievement tracking
+        self.achievements = {
+            "perfect_form": 0,
+            "consecutive_hits": 0,
+            "comeback_wins": 0,
+            "exercises_completed": 0
+        }
+        
+        # Animation state
+        self.damage_animation_time = 0
+        self.heal_animation_time = 0
+        
+        # Attack state for cooldown
+        self.last_attack_time = 0
+        self.attack_cooldown = 1.0  # seconds
+    
     def take_damage(self, damage):
-        """Apply damage to this player and return if they're defeated"""
-        self.current_hp = max(0, self.current_hp - damage)
-        return self.current_hp <= 0
+        """Apply damage to the player, considering comeback bonus"""
+        # Apply comeback bonus for damage reduction (if trailing)
+        if self.comeback_bonus > 1.0:
+            damage = damage / (self.comeback_bonus * 0.75)  # Reduce damage based on comeback bonus
+        
+        # Calculate actual damage after modifiers
+        actual_damage = min(self.current_hp, damage)
+        self.current_hp -= actual_damage
+        
+        # Set damage animation
+        self.damage_animation_time = time.time()
+        
+        # Reset streak if taking damage
+        if self.streak > 1:
+            self.streak = 0
+        
+        # Check if defeated
+        is_defeated = self.current_hp <= 0
+        if is_defeated:
+            self.current_hp = 0
+        
+        return is_defeated
+    
+    def heal(self, amount):
+        """Heal the player by the given amount, considering comeback bonus"""
+        # Apply comeback bonus for increased healing (if trailing)
+        if self.comeback_bonus > 1.0:
+            amount = amount * self.comeback_bonus
+        
+        # Calculate actual healing after bonuses
+        before_heal = self.current_hp
+        self.current_hp = min(self.max_hp, self.current_hp + amount)
+        actual_heal = self.current_hp - before_heal
+        
+        # Set heal animation
+        self.heal_animation_time = time.time()
+        
+        # Award XP for healing
+        self.add_xp(actual_heal * 0.5)
+        
+        return actual_heal
+    
+    def successful_attack(self, damage_dealt):
+        """Update player stats after a successful attack"""
+        # Increase streak counter
+        self.streak += 1
+        
+        # Calculate streak multiplier (caps at 2.0)
+        self.streak_multiplier = min(2.0, 1.0 + self.streak * 0.1)
+        
+        # Award XP based on damage dealt
+        self.add_xp(damage_dealt * 0.75)
+        
+        # Update last attack time
+        self.last_attack_time = time.time()
+        
+        # Update achievements
+        self.achievements["consecutive_hits"] = max(self.achievements["consecutive_hits"], self.streak)
     
     def reset_attack(self):
-        """Reset attack state"""
-        self.attack_ready = False
-        self.attack_power = 0
+        """Reset attack-related attributes"""
+        self.streak = 0
+        self.streak_multiplier = 1.0
     
-    def draw_health_bar(self, frame):
-        """Draw health bar for this player"""
+    def add_xp(self, amount):
+        """Add experience points and level up if necessary"""
+        self.xp += amount
+        
+        # Check for level up
+        if self.xp >= self.xp_to_level:
+            self.level_up()
+    
+    def level_up(self):
+        """Level up the player and increase stats"""
+        self.level += 1
+        
+        # Increase attack power with each level
+        self.attack_power += 5
+        
+        # Increase max HP with each level
+        hp_increase = 100
+        self.max_hp += hp_increase
+        self.current_hp += hp_increase  # Also heal when leveling up
+        
+        # Increase XP requirement for next level (becomes progressively harder)
+        self.xp_to_level = int(self.xp_to_level * 1.5)
+        
+        # Reset XP overflow
+        self.xp = 0
+    
+    def add_powerup(self, powerup_type, duration=10):
+        """Add a powerup to the player"""
+        if powerup_type == "Shield":
+            # Damage reduction
+            self.active_powerups["Shield"] = {
+                "end_time": time.time() + duration,
+                "effect": 0.5  # 50% damage reduction
+            }
+        elif powerup_type == "Strength":
+            # Increased attack
+            self.active_powerups["Strength"] = {
+                "end_time": time.time() + duration,
+                "effect": 2.0  # Double attack power
+            }
+        elif powerup_type == "Regen":
+            # Health regeneration
+            self.active_powerups["Regen"] = {
+                "end_time": time.time() + duration,
+                "effect": 5  # HP per second
+            }
+    
+    def update_powerups(self):
+        """Update active powerups and apply effects"""
+        current_time = time.time()
+        expired_powerups = []
+        
+        for powerup, data in self.active_powerups.items():
+            if current_time > data["end_time"]:
+                expired_powerups.append(powerup)
+            elif powerup == "Regen":
+                # Apply regeneration effect
+                self.heal(data["effect"] * 0.05)  # Scale down for smoother regen
+        
+        # Remove expired powerups
+        for powerup in expired_powerups:
+            del self.active_powerups[powerup]
+    
+    def update_comeback_bonus(self, opponent_health_percent):
+        """Update comeback bonus based on difference in health percentages"""
+        my_health_percent = self.current_hp / self.max_hp
+        
+        # If player is significantly behind (at least 30% difference)
+        if my_health_percent < opponent_health_percent - 0.3:
+            # Scale comeback bonus based on health difference
+            health_diff = opponent_health_percent - my_health_percent
+            self.comeback_bonus = 1.0 + min(1.0, health_diff * 1.5)  # Cap at 2.5x 
+        else:
+            # Reset bonus if not significantly behind
+            self.comeback_bonus = 1.0
+    
+    def draw_position_indicator(self, frame):
+        """Draw a small indicator at player's skeleton position"""
         if self.position[0] == 0 and self.position[1] == 0:
             return
-            
-        # Calculate position and dimensions
+        
         x, y = self.position
-        bar_width = 100
-        bar_height = 10
         
-        # Draw name
-        cv2.putText(frame, self.name, (x, y - 25), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.color, 2)
-        
-        # Draw health text
-        hp_text = f"HP: {self.current_hp}/{self.max_hp}"
-        cv2.putText(frame, hp_text, (x, y - 5), 
+        # Draw name tag above player
+        cv2.putText(frame, self.name, (x - 30, y - 50), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.color, 1)
-        
-        # Draw background bar (full health)
-        cv2.rectangle(frame, (x, y), (x + bar_width, y + bar_height), 
-                     (50, 50, 50), -1)
-        
-        # Draw current health
-        health_width = int(bar_width * (self.current_hp / self.max_hp))
-        cv2.rectangle(frame, (x, y), (x + health_width, y + bar_height), 
-                     self.color, -1)
-        
-        # If attack is ready, show indicator
-        if self.attack_ready:
-            attack_text = f"ATTACK READY: {self.attack_power} DMG"
-            cv2.putText(frame, attack_text, (x, y + 25), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
 
 # ------------------------------
 # 2) AttackExercise Class
@@ -537,11 +929,12 @@ class GameManager:
     """
     Manages the overall game state, players, exercise transitions, and UI.
     
-    Enhanced for elderly users with:
-    - Clear, larger text and UI elements
-    - Simplified controls and instructions
-    - Gentler timing and progression
-    - Comprehensive exercise program with physiotherapy elements
+    Enhanced with simplified gamification:
+    - Arm Raising: Attacks opponent (decreases their health)
+    - Side Stretch: Heals yourself (increases your health)
+    - Chair Squat: Heals yourself (increases your health)
+    - Comeback mechanics for trailing players
+    - Clean, minimalist interface with traditional health bars
     """
     def __init__(self, num_players=2):
         # Initialize players
@@ -553,12 +946,15 @@ class GameManager:
         self.side_stretch_right = SideStretch()
         self.squat_exercise = SquatExercise()
         
+        # Initialize safety monitor
+        self.safety_monitor = FacialSafetyMonitor()
+        
         # Exercise selection
         self.current_exercise = 'attack'  # Set default exercise to 'attack'
         self.exercise_names = {
-            'attack': 'Arm Raising',
-            'side_stretch': 'Side Stretch',
-            'squat': 'Chair Squat'
+            'attack': 'Arm Raising (Attack)',
+            'side_stretch': 'Side Stretch (Heal)',
+            'squat': 'Chair Squat (Heal)'
         }
         
         # Game state
@@ -572,15 +968,39 @@ class GameManager:
         }
         self.last_exercise_switch_time = time.time()
         
-        # Elderly-friendly UI settings
-        self.large_font_scale = 0.9
-        self.font_thickness = 2
-        self.high_contrast_colors = {
-            'title': (255, 255, 255),  # White
-            'instruction': (220, 220, 220),  # Light gray
-            'positive': (50, 200, 50),  # Softer green
-            'warning': (50, 150, 230)   # Softer orange (not harsh red)
+        # Enhanced UI settings
+        self.font_scale = 0.7
+        self.font_thickness = 1
+        self.colors = {
+            'text': (255, 255, 255),           # White
+            'background': (10, 10, 30),        # Deep blue-black
+            'health_p1': (30, 30, 220),        # Red (BGR)
+            'health_p2': (30, 220, 30),        # Green (BGR)
+            'health_bg': (70, 70, 70),         # Dark gray
+            'health_border': (200, 200, 200),  # Light gray
+            'instruction': (200, 200, 200),    # Light gray
+            'warning': (50, 150, 230),         # Soft orange
+            'ui_accent': (255, 200, 40),       # Golden yellow
+            'ui_highlight': (180, 230, 255),   # Light cyan
         }
+        
+        # Visual effects
+        self.screen_flash = 0  # For attack/heal flash effects
+        self.screen_flash_color = (0, 0, 0)
+        self.screen_flash_start = 0
+        
+        # Animation timers
+        self.heart_animation = 0
+        self.heart_animation_start = 0
+        self.heart_scale = 1.0
+        self.health_bar_pulse = 0
+        
+        # Power-up spawn timing
+        self.last_powerup_time = time.time()
+        self.powerup_interval = 30  # seconds
+        
+        # Save current keypoints for animation effects
+        self._current_keypoints_list = []
         
         # Initialize exercises for both sides
         self.side_stretch_left.set_stretch_side('left')
@@ -593,16 +1013,48 @@ class GameManager:
     def process_frame(self, frame, keypoints_list):
         """Process a frame and update game state based on the current exercise."""
         try:
+            # Save keypoints for animation effects
+            self._current_keypoints_list = keypoints_list
+            
             # Update exercise timing
             current_time = time.time()
             elapsed = current_time - self.last_exercise_switch_time
             self.exercise_time[self.current_exercise] += elapsed
             self.last_exercise_switch_time = current_time
             
+            # Process facial expressions for safety monitoring
+            if len(keypoints_list) > 0:
+                expression, confidence = self.safety_monitor.analyze_expression(keypoints_list[0], frame)
+                
+                # Get feedback if needed based on expression
+                feedback = self.safety_monitor.get_feedback(expression)
+                if feedback and expression == "struggling":
+                    # Immediately show feedback for struggling users
+                    self.attack_exercise._add_floating_text(
+                        feedback,
+                        int(keypoints_list[0][0][0]),  # nose x
+                        int(keypoints_list[0][0][1] - 100),  # above nose
+                        (50, 50, 255)  # red for urgency
+                    )
+                elif feedback and current_time % 15 < 0.1:  # Occasionally show for other expressions
+                    self.attack_exercise._add_floating_text(
+                        feedback,
+                        int(keypoints_list[0][0][0]),  # nose x
+                        int(keypoints_list[0][0][1] - 100),  # above nose
+                        (50, 255, 50) if expression == "enjoying" else (255, 255, 50)  # green or yellow
+                    )
+            
+            # Update comeback bonuses based on relative health
+            self._update_comeback_mechanics()
+            
+            # Handle powerup spawning
+            self._handle_powerups(current_time)
+            
             # Process each player's movement based on the current exercise
             for i, player in enumerate(self.players):
                 if i < len(keypoints_list):
                     if self.current_exercise == 'attack':
+                        # OFFENSE: Arm Raising attacks opponent
                         attack_msg, target_id = self.attack_exercise.process_keypoints(i, keypoints_list[i])
                         
                         # Apply attack if one was triggered
@@ -613,114 +1065,609 @@ class GameManager:
                             # Apply damage to target player
                             is_defeated = target_player.take_damage(attack_power)
                             
+                            # Update attacker's streak and XP
+                            player.successful_attack(attack_power)
+                            
+                            # Trigger heart animation
+                            self.heart_animation = 1.0
+                            self.heart_animation_start = current_time
+                            
+                            # Visual attack effect
+                            self._trigger_screen_flash((0, 0, 200), 0.3)  # Red flash for attack
+                            
                             # Check for game over
                             if is_defeated:
                                 self.game_over = True
                                 self.winner = player
+                                if target_player.current_hp < target_player.max_hp * 0.2:
+                                    player.achievements["comeback_wins"] += 1
                                 
                         # Reset attack state if needed        
                         self.attack_exercise.finalize_if_needed(i)
                         
                     elif self.current_exercise == 'side_stretch':
-                        # Process side stretch for the appropriate player and side
+                        # HEALING: Side Stretch heals player
                         if i == 0:  # Player 1 does left side stretch
                             self.side_stretch_left.update_stretch(keypoints_list[i])
+                            # Apply healing if available
+                            if self.side_stretch_left.heal_power > 0:
+                                heal_amount = self._apply_healing(i, self.side_stretch_left.heal_power)
+                                # Add achievement if it was a perfect form
+                                if self.side_stretch_left.heal_power >= 15:  # Level 3 stretch
+                                    player.achievements["perfect_form"] += 1
+                                # Reset heal power after applying
+                                self.side_stretch_left.heal_power = 0
+                                
                         elif i == 1:  # Player 2 does right side stretch
                             self.side_stretch_right.update_stretch(keypoints_list[i])
+                            # Apply healing if available
+                            if self.side_stretch_right.heal_power > 0:
+                                heal_amount = self._apply_healing(i, self.side_stretch_right.heal_power)
+                                # Add achievement if it was a perfect form
+                                if self.side_stretch_right.heal_power >= 15:  # Level 3 stretch
+                                    player.achievements["perfect_form"] += 1
+                                # Reset heal power after applying
+                                self.side_stretch_right.heal_power = 0
                             
                     elif self.current_exercise == 'squat':
-                        # Process squat exercise for each player
+                        # HEALING: Chair Squat heals player
                         self.squat_exercise.update_squat(keypoints_list[i])
+                        # Apply healing if available
+                        if self.squat_exercise.heal_power > 0:
+                            heal_amount = self._apply_healing(i, self.squat_exercise.heal_power)
+                            # Add achievement if it was a perfect form
+                            if self.squat_exercise.heal_power >= 24:  # Level 3 squat
+                                player.achievements["perfect_form"] += 1
+                            # Reset heal power after applying
+                            self.squat_exercise.heal_power = 0
+                    
+                    # Update player powerups
+                    player.update_powerups()
 
-            # Draw health bars and game state
+            # Draw UI elements
             self._draw_game_ui(frame)
+            
+            # Apply screen flash effects if active
+            self._apply_screen_effects(frame, current_time)
             
         except Exception as e:
             print(f"Error in game processing: {e}")
     
-    def _draw_game_ui(self, frame):
-        """Draw elderly-friendly game UI elements"""
-        try:
-            # Draw health bars for each player
-            for player in self.players:
-                player.draw_health_bar(frame)
+    def _apply_healing(self, player_id, heal_amount):
+        """Apply healing to a player with comeback bonus"""
+        if player_id < len(self.players):
+            player = self.players[player_id]
             
-            # Draw session information in top-left corner
+            # Apply the healing and get actual amount healed
+            actual_heal = player.heal(heal_amount)
+            
+            # Trigger heart animation
+            self.heart_animation = 1.0
+            self.heart_animation_start = time.time()
+            
+            # Visual heal effect
+            self._trigger_screen_flash((0, 200, 0), 0.3)  # Green flash for healing
+            
+            return actual_heal
+        return 0
+    
+    def _update_comeback_mechanics(self):
+        """Update comeback bonuses for players who are behind"""
+        if len(self.players) < 2:
+            return
+            
+        # Calculate health percentages
+        p1_percent = self.players[0].current_hp / self.players[0].max_hp
+        p2_percent = self.players[1].current_hp / self.players[1].max_hp
+        
+        # Update comeback bonuses for both players
+        self.players[0].update_comeback_bonus(p2_percent)
+        self.players[1].update_comeback_bonus(p1_percent)
+    
+    def _trigger_screen_flash(self, color, duration=0.2):
+        """Trigger a screen flash effect"""
+        self.screen_flash = 1.0
+        self.screen_flash_color = color
+        self.screen_flash_start = time.time()
+        self.screen_flash_duration = duration
+    
+    def _apply_screen_effects(self, frame, current_time):
+        """Apply active screen effects like flashes"""
+        if self.screen_flash > 0:
+            # Calculate flash intensity based on time
+            elapsed = current_time - self.screen_flash_start
+            if elapsed < self.screen_flash_duration:
+                # Fade out effect
+                intensity = 1.0 - (elapsed / self.screen_flash_duration)
+                
+                # Create overlay
+                overlay = frame.copy()
+                color = tuple(int(c * intensity * 0.5) for c in self.screen_flash_color)
+                cv2.rectangle(overlay, (0, 0), (frame.shape[1], frame.shape[0]), color, -1)
+                
+                # Apply overlay with alpha
+                alpha = 0.3 * intensity
+                cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+            else:
+                self.screen_flash = 0
+    
+    def _handle_powerups(self, current_time):
+        """Spawn and manage powerups for the player who's behind"""
+        # Check if it's time to spawn a powerup
+        if current_time - self.last_powerup_time > self.powerup_interval:
+            # Give powerup to player with lower health
+            if len(self.players) >= 2:
+                p1_hp_percent = self.players[0].current_hp / self.players[0].max_hp
+                p2_hp_percent = self.players[1].current_hp / self.players[1].max_hp
+                
+                if abs(p1_hp_percent - p2_hp_percent) > 0.2:  # At least 20% difference
+                    # Give powerup to player with less health
+                    target_player = 0 if p1_hp_percent < p2_hp_percent else 1
+                    
+                    # Random powerup: Shield, Strength, or Regen
+                    powerup_types = ["Shield", "Strength", "Regen"]
+                    import random
+                    powerup = random.choice(powerup_types)
+                    
+                    # Apply powerup
+                    self.players[target_player].add_powerup(powerup, duration=15)
+                    
+                    # Add a notification
+                    self.attack_exercise._add_floating_text(
+                        f"{self.players[target_player].name} got {powerup} boost!",
+                        frame.shape[1] // 2,
+                        frame.shape[0] // 2 - 100,
+                        (0, 255, 255)  # Yellow
+                    )
+                    
+                    # Reset timer
+                    self.last_powerup_time = current_time
+    
+    # ---- UI Drawing Helper Methods ----
+    
+    def _draw_heart_outline(self, frame, x, y, scale=1.0, alpha=1.0):
+        """Draw heart outline for Player 1 health"""
+        heart_width, heart_height = 20, 20
+        w = int(heart_width * scale)
+        h = int(heart_height * scale)
+        
+        # Adjusted for center point
+        x = int(x - w/2)
+        y = int(y - h/2)
+        
+        # Heart shape points
+        heart_shape = np.array([
+            [0, h/4], 
+            [w/4, 0], 
+            [w/2, h/4], 
+            [3*w/4, 0], 
+            [w, h/4], 
+            [w/2, h], 
+            [0, h/4]
+        ], dtype=np.int32)
+        
+        # Adjust points to position
+        heart_shape[:, 0] += x
+        heart_shape[:, 1] += y
+        
+        # Draw outline with darker color
+        color = tuple(int(c * alpha) for c in self.colors['health_border'])
+        cv2.polylines(frame, [heart_shape], True, color, 2)
+    
+    def _draw_heart_filled(self, frame, x, y, scale=1.0, alpha=1.0, pulse=0):
+        """Draw filled heart for Player 1 health"""
+        heart_width, heart_height = 20, 20
+        w = int(heart_width * scale)
+        h = int(heart_height * scale)
+        
+        # Apply pulse effect
+        pulse_scale = 1.0 + 0.1 * pulse
+        w = int(w * pulse_scale)
+        h = int(h * pulse_scale)
+        
+        # Adjusted for center point
+        x = int(x - w/2)
+        y = int(y - h/2)
+        
+        # Heart shape points
+        heart_shape = np.array([
+            [0, h/4], 
+            [w/4, 0], 
+            [w/2, h/4], 
+            [3*w/4, 0], 
+            [w, h/4], 
+            [w/2, h], 
+            [0, h/4]
+        ], dtype=np.int32)
+        
+        # Adjust points to position
+        heart_shape[:, 0] += x
+        heart_shape[:, 1] += y
+        
+        # Draw filled heart
+        color = tuple(int(c * alpha) for c in self.colors['health_p1'])
+        cv2.fillPoly(frame, [heart_shape], color)
+        
+        # Draw outline for better visibility
+        outline_color = tuple(int(min(c + 50, 255) * alpha) for c in self.colors['health_p1'])
+        cv2.polylines(frame, [heart_shape], True, outline_color, 1)
+    
+    def _draw_heart_half(self, frame, x, y, scale=1.0, alpha=1.0):
+        """Draw half-filled heart for Player 1 health"""
+        heart_width, heart_height = 20, 20
+        w = int(heart_width * scale)
+        h = int(heart_height * scale)
+        
+        # Adjusted for center point
+        x = int(x - w/2)
+        y = int(y - h/2)
+        
+        # Heart shape points
+        full_heart = np.array([
+            [0, h/4], 
+            [w/4, 0], 
+            [w/2, h/4], 
+            [3*w/4, 0], 
+            [w, h/4], 
+            [w/2, h], 
+            [0, h/4]
+        ], dtype=np.int32)
+        
+        # Half heart (left side)
+        half_heart = np.array([
+            [0, h/4], 
+            [w/4, 0], 
+            [w/2, h/4], 
+            [w/2, h], 
+            [0, h/4]
+        ], dtype=np.int32)
+        
+        # Adjust points to position
+        full_heart[:, 0] += x
+        full_heart[:, 1] += y
+        half_heart[:, 0] += x
+        half_heart[:, 1] += y
+        
+        # Draw outline of full heart
+        outline_color = tuple(int(c * alpha) for c in self.colors['health_border'])
+        cv2.polylines(frame, [full_heart], True, outline_color, 2)
+        
+        # Fill half of the heart
+        color = tuple(int(c * alpha) for c in self.colors['health_p1'])
+        cv2.fillPoly(frame, [half_heart], color)
+    
+    def _draw_player1_hearts(self, frame, player):
+        """Draw Minecraft-style hearts for Player 1"""
+        # Position at bottom left
+        h, w = frame.shape[:2]
+        base_x, base_y = 50, h - 50
+        
+        # Draw health bar background panel
+        panel_height = 40
+        panel_width = 320
+        cv2.rectangle(frame, (10, base_y - 20), (10 + panel_width, base_y + panel_height), 
+                     (0, 0, 0, 128), -1)
+        
+        # Draw player name
+        cv2.putText(frame, player.name, (20, base_y - 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['health_p1'], 1)
+        
+        # Calculate hearts
+        hp_percent = player.current_hp / player.max_hp
+        max_hearts = 10
+        full_hearts = int(hp_percent * max_hearts)
+        half_heart = (hp_percent * max_hearts) - full_hearts > 0.5
+        
+        # Scale and animation effects
+        heart_scale = 1.0
+        anim_pulse = 0
+        
+        # Apply animation if recent health change
+        current_time = time.time()
+        if self.heart_animation > 0:
+            elapsed = current_time - self.heart_animation_start
+            if elapsed < 0.5:
+                # Heart animation effect
+                anim_pulse = math.sin(elapsed * 20) * (1.0 - elapsed * 2)
+                heart_scale = 1.0 + 0.2 * anim_pulse
+            else:
+                self.heart_animation = 0
+        
+        # Draw hearts with spacing
+        heart_spacing = 25
+        for i in range(max_hearts):
+            x = base_x + i * heart_spacing
+            
+            # Heart animation for this specific heart
+            this_heart_pulse = 0
+            if i == full_hearts - 1 or (i == full_hearts and half_heart):
+                this_heart_pulse = anim_pulse
+                
+            # Draw heart outlines first (all containers)
+            self._draw_heart_outline(frame, x, base_y)
+            
+            # Draw filled hearts
+            if i < full_hearts:
+                self._draw_heart_filled(frame, x, base_y, pulse=this_heart_pulse)
+            elif i == full_hearts and half_heart:
+                self._draw_heart_half(frame, x, base_y)
+        
+        # Draw health percentage
+        health_text = f"{int(hp_percent * 100)}%"
+        cv2.putText(frame, health_text, (base_x + max_hearts * heart_spacing + 10, base_y + 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['health_p1'], 1)
+    
+    def _draw_player2_bar(self, frame, player):
+        """Draw Minecraft-style hearts for Player 2 (bottom right)"""
+        # Position at bottom right
+        h, w = frame.shape[:2]
+        base_x, base_y = w - 300, h - 50
+        
+        # Draw health bar background panel
+        panel_height = 40
+        panel_width = 320
+        cv2.rectangle(frame, (w - 10 - panel_width, base_y - 20), 
+                     (w - 10, base_y + panel_height), (0, 0, 0, 128), -1)
+        
+        # Draw player name (right-aligned)
+        name_size = cv2.getTextSize(player.name, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)[0]
+        cv2.putText(frame, player.name, (w - 20 - name_size[0], base_y - 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['health_p2'], 1)
+        
+        # Calculate hearts
+        hp_percent = player.current_hp / player.max_hp
+        max_hearts = 10
+        full_hearts = int(hp_percent * max_hearts)
+        half_heart = (hp_percent * max_hearts) - full_hearts > 0.5
+        
+        # Scale and animation effects
+        heart_scale = 1.0
+        anim_pulse = 0
+        
+        # Apply animation if recent health change
+        current_time = time.time()
+        if self.heart_animation > 0:
+            elapsed = current_time - self.heart_animation_start
+            if elapsed < 0.5:
+                # Heart animation effect
+                anim_pulse = math.sin(elapsed * 20) * (1.0 - elapsed * 2)
+                heart_scale = 1.0 + 0.2 * anim_pulse
+            else:
+                self.heart_animation = 0
+        
+        # Draw hearts with spacing - right to left for Player 2
+        heart_spacing = 25
+        for i in range(max_hearts):
+            # Position from right to left
+            x = base_x - i * heart_spacing
+            
+            # Heart animation for this specific heart
+            this_heart_pulse = 0
+            if i == max_hearts - full_hearts or (i == max_hearts - full_hearts - 1 and half_heart):
+                this_heart_pulse = anim_pulse
+                
+            # Draw heart outlines first (all containers)
+            self._draw_p2_heart_outline(frame, x, base_y)
+            
+            # Draw filled hearts
+            if i < (max_hearts - full_hearts):
+                # Empty hearts
+                pass
+            elif i == (max_hearts - full_hearts) and half_heart:
+                # Half-filled heart
+                self._draw_p2_heart_half(frame, x, base_y)
+            else:
+                # Fully filled hearts
+                self._draw_p2_heart_filled(frame, x, base_y, pulse=this_heart_pulse)
+        
+        # Draw health percentage
+        health_text = f"{int(hp_percent * 100)}%"
+        cv2.putText(frame, health_text, (base_x - max_hearts * heart_spacing - 40, base_y + 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['health_p2'], 1)
+    
+    def _draw_p2_heart_outline(self, frame, x, y, scale=1.0, alpha=1.0):
+        """Draw heart outline for Player 2 health"""
+        heart_width, heart_height = 20, 20
+        w = int(heart_width * scale)
+        h = int(heart_height * scale)
+        
+        # Adjusted for center point
+        x = int(x - w/2)
+        y = int(y - h/2)
+        
+        # Heart shape points
+        heart_shape = np.array([
+            [0, h/4], 
+            [w/4, 0], 
+            [w/2, h/4], 
+            [3*w/4, 0], 
+            [w, h/4], 
+            [w/2, h], 
+            [0, h/4]
+        ], dtype=np.int32)
+        
+        # Adjust points to position
+        heart_shape[:, 0] += x
+        heart_shape[:, 1] += y
+        
+        # Draw outline with darker color
+        color = tuple(int(c * alpha) for c in self.colors['health_border'])
+        cv2.polylines(frame, [heart_shape], True, color, 2)
+    
+    def _draw_p2_heart_filled(self, frame, x, y, scale=1.0, alpha=1.0, pulse=0):
+        """Draw filled heart for Player 2 health"""
+        heart_width, heart_height = 20, 20
+        w = int(heart_width * scale)
+        h = int(heart_height * scale)
+        
+        # Apply pulse effect
+        pulse_scale = 1.0 + 0.1 * pulse
+        w = int(w * pulse_scale)
+        h = int(h * pulse_scale)
+        
+        # Adjusted for center point
+        x = int(x - w/2)
+        y = int(y - h/2)
+        
+        # Heart shape points
+        heart_shape = np.array([
+            [0, h/4], 
+            [w/4, 0], 
+            [w/2, h/4], 
+            [3*w/4, 0], 
+            [w, h/4], 
+            [w/2, h], 
+            [0, h/4]
+        ], dtype=np.int32)
+        
+        # Adjust points to position
+        heart_shape[:, 0] += x
+        heart_shape[:, 1] += y
+        
+        # Draw filled heart with player 2 color
+        color = tuple(int(c * alpha) for c in self.colors['health_p2'])
+        cv2.fillPoly(frame, [heart_shape], color)
+        
+        # Draw outline for better visibility
+        outline_color = tuple(int(min(c + 50, 255) * alpha) for c in self.colors['health_p2'])
+        cv2.polylines(frame, [heart_shape], True, outline_color, 1)
+    
+    def _draw_p2_heart_half(self, frame, x, y, scale=1.0, alpha=1.0):
+        """Draw half-filled heart for Player 2 health"""
+        heart_width, heart_height = 20, 20
+        w = int(heart_width * scale)
+        h = int(heart_height * scale)
+        
+        # Adjusted for center point
+        x = int(x - w/2)
+        y = int(y - h/2)
+        
+        # Heart shape points
+        full_heart = np.array([
+            [0, h/4], 
+            [w/4, 0], 
+            [w/2, h/4], 
+            [3*w/4, 0], 
+            [w, h/4], 
+            [w/2, h], 
+            [0, h/4]
+        ], dtype=np.int32)
+        
+        # Half heart (left side)
+        half_heart = np.array([
+            [0, h/4], 
+            [w/4, 0], 
+            [w/2, h/4], 
+            [w/2, h], 
+            [0, h/4]
+        ], dtype=np.int32)
+        
+        # Adjust points to position
+        full_heart[:, 0] += x
+        full_heart[:, 1] += y
+        half_heart[:, 0] += x
+        half_heart[:, 1] += y
+        
+        # Draw outline of full heart
+        outline_color = tuple(int(c * alpha) for c in self.colors['health_border'])
+        cv2.polylines(frame, [full_heart], True, outline_color, 2)
+        
+        # Fill half of the heart with player 2 color
+        color = tuple(int(c * alpha) for c in self.colors['health_p2'])
+        cv2.fillPoly(frame, [half_heart], color)
+    
+    def _draw_game_ui(self, frame):
+        """Draw enhanced game UI elements"""
+        try:
+            # Draw player health indicators
+            if len(self.players) >= 1:
+                self._draw_player1_hearts(frame, self.players[0])
+            if len(self.players) >= 2:
+                self._draw_player2_bar(frame, self.players[1])
+            
+            # Draw session time in top-left
             session_time = time.time() - self.session_start_time
             minutes, seconds = divmod(int(session_time), 60)
-            session_text = f"Exercise Time: {minutes:02d}:{seconds:02d}"
+            time_text = f"Time: {minutes:02d}:{seconds:02d}"
             
-            cv2.putText(frame, session_text, 
-                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                       self.large_font_scale, self.high_contrast_colors['title'], self.font_thickness)
+            # Draw semi-transparent header bar
+            header_height = 30
+            cv2.rectangle(frame, (0, 0), (frame.shape[1], header_height), 
+                         (0, 0, 0, 180), -1)
             
-            # Draw current exercise with larger font
+            # Draw timer
+            cv2.putText(frame, time_text, (10, 22), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['text'], 1)
+            
+            # Draw current exercise name in top center
             if self.current_exercise:
                 exercise_name = self.exercise_names.get(self.current_exercise, self.current_exercise.capitalize())
-                exercise_text = f"Current Exercise: {exercise_name}"
-                cv2.putText(frame, exercise_text, 
-                           (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 
-                           self.large_font_scale, self.high_contrast_colors['title'], self.font_thickness)
+                # Center text
+                text_size = cv2.getTextSize(exercise_name, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)[0]
+                text_x = (frame.shape[1] - text_size[0]) // 2
+                cv2.putText(frame, exercise_name, (text_x, 22), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.colors['text'], 1)
             
-            # Draw keyboard shortcuts - larger and clearer for elderly
-            shortcuts_y = frame.shape[0] - 60
-            cv2.putText(frame, "Controls: 1=Arm Raise | 2=Side Stretch | 3=Squat | r=Reset | q=Quit", 
-                       (10, shortcuts_y), cv2.FONT_HERSHEY_SIMPLEX, 
-                       0.7, self.high_contrast_colors['instruction'], 1)
+            # Draw facial expression status in a more compact form
+            self.safety_monitor.draw_expression_status(frame, (frame.shape[1] - 160, 22))
+            
+            # Draw small instruction bar at bottom
+            control_height = 25
+            control_y = frame.shape[0] - control_height
+            
+            # Draw semi-transparent background for controls
+            control_bg = frame.copy()
+            cv2.rectangle(control_bg, (0, control_y), 
+                         (frame.shape[1], frame.shape[0]), 
+                         self.colors['background'], -1)
+            cv2.addWeighted(control_bg, 0.6, frame, 0.4, 0, frame)
+            
+            # Draw controls with minimal text
+            controls_text = "1=Attack | 2=Stretch | 3=Squat | r=Reset | q=Quit"
+            text_size = cv2.getTextSize(controls_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
+            text_x = (frame.shape[1] - text_size[0]) // 2
+            cv2.putText(frame, controls_text, (text_x, control_y + 18), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, self.colors['instruction'], 1)
 
             # Draw exercise-specific UI elements
             if self.current_exercise == 'side_stretch':
-                # Display stretch information and feedback for both players
+                # Display stretch information for both players
                 if len(self.players) >= 1:
                     # Left side stretch feedback (Player 1)
                     self.side_stretch_left.draw_feedback(frame, position=(20, 120))
-                    left_score = self.side_stretch_left.score
-                    cv2.putText(frame, f"Player 1 Score: {left_score}", 
-                                (20, 220), cv2.FONT_HERSHEY_SIMPLEX, 
-                                0.7, self.players[0].color, self.font_thickness)
                 
                 if len(self.players) >= 2:
                     # Right side stretch feedback (Player 2)
                     self.side_stretch_right.draw_feedback(frame, position=(frame.shape[1] - 300, 120))
-                    right_score = self.side_stretch_right.score
-                    cv2.putText(frame, f"Player 2 Score: {right_score}", 
-                                (frame.shape[1] - 300, 220), cv2.FONT_HERSHEY_SIMPLEX, 
-                                0.7, self.players[1].color, self.font_thickness)
             
             elif self.current_exercise == 'squat':
                 # Show squat exercise feedback
                 self.squat_exercise.draw_feedback(frame, position=(30, 120))
-                
-                # Draw score
-                squat_score = self.squat_exercise.score
-                cv2.putText(frame, f"Squat Score: {squat_score}", 
-                           (30, 350), cv2.FONT_HERSHEY_SIMPLEX, 
-                           0.8, self.high_contrast_colors['positive'], self.font_thickness)
 
             # Draw game state if game is over
             if self.game_over and self.winner:
-                # Draw semi-transparent overlay for better readability
+                # Draw semi-transparent overlay
                 overlay = frame.copy()
-                cv2.rectangle(overlay, (0, frame.shape[0]//2 - 60), 
-                             (frame.shape[1], frame.shape[0]//2 + 60), (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+                cv2.rectangle(overlay, (0, 0), (frame.shape[1], frame.shape[0]), (0, 0, 0), -1)
+                cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
                 
+                # Draw winner text
                 winner_text = f"{self.winner.name} WINS!"
-                cv2.putText(frame, winner_text, 
-                            (frame.shape[1]//2 - 150, frame.shape[0]//2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, self.winner.color, 3)
+                text_size = cv2.getTextSize(winner_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 2)[0]
+                text_x = (frame.shape[1] - text_size[0]) // 2
+                text_y = frame.shape[0] // 2
+                cv2.putText(frame, winner_text, (text_x, text_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, self.winner.color, 2)
                 
-                # Instruction to restart - larger for elderly users
-                cv2.putText(frame, "Press 'r' to restart", 
-                            (frame.shape[1]//2 - 150, frame.shape[0]//2 + 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, self.high_contrast_colors['instruction'], 2)
+                # Instruction to restart
+                restart_text = "Press 'r' to restart"
+                text_size = cv2.getTextSize(restart_text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 1)[0]
+                text_x = (frame.shape[1] - text_size[0]) // 2
+                cv2.putText(frame, restart_text, (text_x, text_y + 40),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.colors['instruction'], 1)
                             
-            # Add helpful elderly-focused reminder about taking breaks
-            if session_time > 300 and session_time % 300 < 10:  # Every 5 minutes
-                reminder_text = "Remember to take a short break if needed"
-                cv2.putText(frame, reminder_text, 
-                           (frame.shape[1]//2 - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                           0.7, self.high_contrast_colors['warning'], self.font_thickness)
+            # Draw floating messages
+            self.attack_exercise.draw_messages(frame)
                 
         except Exception as e:
             print(f"Error drawing game UI: {e}")
@@ -741,6 +1688,9 @@ class GameManager:
         # Reset squat exercise
         self.squat_exercise.score = 0
         self.squat_exercise.completed_squats = {1: 0, 2: 0, 3: 0}
+        
+        # Reset powerup timer
+        self.last_powerup_time = time.time()
             
         self.game_over = False
         self.winner = None
@@ -763,7 +1713,7 @@ class SideStretch:
     Level 2: 30° lateral bend - Intermediate
     Level 3: 45° lateral bend - Advanced
     
-    Must maintain proper posture (straight spine) and hold stretch for minimum time.
+    Restores health to the player when performed correctly.
     """
     def __init__(self):
         # Angles for different levels (in degrees)
@@ -771,6 +1721,7 @@ class SideStretch:
         self.current_level = 0
         self.score = 0
         self.stretch_side = None  # 'left' or 'right'
+        self.heal_power = 0  # How much health to restore
         
         # Stretch validation parameters
         self.hold_time_required = 2.0  # seconds to hold at a level
@@ -907,6 +1858,7 @@ class SideStretch:
                     self.last_message_time = current_time
                 self.is_stretching = False
                 self.stretch_start_time = 0
+                self.heal_power = 0
                 return
                 
             # Handle level transitions
@@ -927,13 +1879,14 @@ class SideStretch:
                     if hold_duration >= self.hold_time_required:
                         # Complete the stretch if we haven't given points for this hold yet
                         if self.last_stretch_level == current_level:
-                            # Award points
+                            # Set healing power based on level (5, 10, or 15 health)
+                            self.heal_power = 5 * current_level
                             points = 10 * current_level
                             self.score += points
                             self.completed_stretches[current_level] += 1
                             
                             # Update feedback
-                            self.feedback = f"Level {current_level} complete! +{points} points"
+                            self.feedback = f"Great stretch! +{self.heal_power} Health"
                             self.feedback_color = (0, 255, 0)  # Green for success
                             self.last_message_time = current_time
                             
@@ -943,6 +1896,7 @@ class SideStretch:
             else:
                 # Not actively stretching
                 self.is_stretching = False
+                self.heal_power = 0
                 
         except Exception as e:
             print(f"Error updating stretch: {e}")
@@ -950,17 +1904,20 @@ class SideStretch:
     def draw_feedback(self, frame, position=(20, 120)):
         """Draw stretch feedback on the frame."""
         try:
-            if not self.feedback:
-                return
+            # Draw title
+            cv2.putText(frame, "Side Stretch - Heals You", position,
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
                 
             # Draw the feedback text
-            cv2.putText(frame, self.feedback, position,
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.feedback_color, 2)
+            if self.feedback:
+                y_pos = position[1] + 40
+                cv2.putText(frame, self.feedback, (position[0], y_pos),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.feedback_color, 2)
                        
             # Draw stretch side indicator
             side_text = f"Stretch Side: {self.stretch_side.capitalize()}" if self.stretch_side else ""
             if side_text:
-                y_offset = position[1] + 30
+                y_offset = position[1] + 80
                 cv2.putText(frame, side_text, (position[0], y_offset),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
             
@@ -968,7 +1925,7 @@ class SideStretch:
             if self.is_stretching:
                 hold_time = time.time() - self.stretch_start_time
                 timer_text = f"Hold: {hold_time:.1f}s / {self.hold_time_required:.1f}s"
-                y_offset = position[1] + 60
+                y_offset = position[1] + 120
                 
                 # Color changes as time progresses
                 progress = min(1.0, hold_time / self.hold_time_required)
@@ -979,13 +1936,7 @@ class SideStretch:
                 )
                 
                 cv2.putText(frame, timer_text, (position[0], y_offset),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, timer_color, 2)
-                           
-            # Show statistics
-            stats_text = f"Completed: L1:{self.completed_stretches[1]} L2:{self.completed_stretches[2]} L3:{self.completed_stretches[3]}"
-            y_offset = position[1] + 90
-            cv2.putText(frame, stats_text, (position[0], y_offset),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.8, timer_color, 2)
                 
         except Exception as e:
             print(f"Error drawing stretch feedback: {e}")
@@ -1008,12 +1959,7 @@ class SquatExercise:
     Level 2: 30° knee bend - Mild strengthening
     Level 3: 45° knee bend - Moderate strengthening
     
-    Safety features:
-    - Validates proper alignment of knees (not extending beyond toes)
-    - Monitors balance and stability
-    - Ensures proper posture and back alignment
-    - Slower hold times appropriate for elderly users
-    - Clear feedback and encouragement
+    Restores health to the player when performed correctly.
     """
     def __init__(self):
         # Angles for different squat depths (in degrees)
@@ -1025,6 +1971,7 @@ class SquatExercise:
         
         self.current_level = 0
         self.score = 0
+        self.heal_power = 0  # How much health to restore
         
         # Validation parameters appropriate for elderly users
         self.hold_time_required = 3.0  # longer hold time for stability
@@ -1247,6 +2194,7 @@ class SquatExercise:
                     self.last_message_time = current_time
                 self.is_squatting = False
                 self.squat_start_time = 0
+                self.heal_power = 0
                 return
             
             # Handle squat transitions
@@ -1260,7 +2208,7 @@ class SquatExercise:
                     
                     level_name = self.levels[current_level]['name']
                     self.feedback = f"Holding {level_name} Squat..."
-                    self.detailed_feedback = "Excellent form!\nKeep holding steady."
+                    self.detailed_feedback = "Good form!"
                     self.feedback_color = (255, 255, 0)  # Yellow for in-progress
                 elif self.is_squatting:
                     # Continuing same level squat
@@ -1270,7 +2218,8 @@ class SquatExercise:
                     if hold_duration >= self.hold_time_required:
                         # Complete the squat if we haven't given points for this hold yet
                         if self.last_squat_level == current_level:
-                            # Award points (higher points for elderly accomplishments)
+                            # Set healing power (8, 16, or 24 health)
+                            self.heal_power = 8 * current_level
                             points = 15 * current_level
                             self.score += points
                             self.completed_squats[current_level] += 1
@@ -1278,8 +2227,8 @@ class SquatExercise:
                             
                             # Update feedback with encouragement for elderly users
                             level_name = self.levels[current_level]['name']
-                            self.feedback = f"{level_name} Squat complete!"
-                            self.detailed_feedback = f"+{points} points\nWonderful job!"
+                            self.feedback = f"Great job! +{self.heal_power} Health"
+                            self.detailed_feedback = "Well done!"
                             self.feedback_color = (0, 255, 0)  # Green for success
                             self.last_message_time = current_time
                             self.last_rep_time = current_time
@@ -1289,11 +2238,12 @@ class SquatExercise:
                             self.last_squat_level = 0
             else:
                 # Not actively squatting
+                self.heal_power = 0
                 time_since_last_rep = current_time - self.last_rep_time
                 if time_since_last_rep > 5.0 and time_since_last_rep < 6.0:
                     # Gentle reminder if they've been standing a while
                     self.feedback = "Ready for next squat when you are"
-                    self.detailed_feedback = "Take your time.\nBend knees gently when ready."
+                    self.detailed_feedback = "Bend knees when ready"
                     self.feedback_color = (200, 200, 200)  # Light gray for gentle reminder
                 self.is_squatting = False
                 
@@ -1304,7 +2254,7 @@ class SquatExercise:
         """Draw squat feedback on the frame with elderly-friendly format."""
         try:
             # Always show title
-            cv2.putText(frame, "Squat Exercise", position,
+            cv2.putText(frame, "Chair Squat - Heals You", position,
                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
             
             # Main feedback - make larger and clearer for elderly users
@@ -1313,20 +2263,17 @@ class SquatExercise:
                 cv2.putText(frame, self.feedback, (position[0], pos_y),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, self.feedback_color, 2)
                            
-            # Detailed feedback
+            # Simplified detailed feedback
             if self.detailed_feedback:
-                lines = self.detailed_feedback.split('\n')
                 y_offset = position[1] + 80
-                for line in lines:
-                    cv2.putText(frame, line, (position[0], y_offset),
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.feedback_color, 1)
-                    y_offset += 25
+                cv2.putText(frame, self.detailed_feedback, (position[0], y_offset),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, self.feedback_color, 1)
             
             # If actively squatting, show hold timer with larger font
             if self.is_squatting:
                 hold_time = time.time() - self.squat_start_time
                 timer_text = f"Hold: {hold_time:.1f}s / {self.hold_time_required:.1f}s"
-                y_offset = position[1] + 170
+                y_offset = position[1] + 120
                 
                 # Color changes as time progresses (gentler transition for elderly)
                 progress = min(1.0, hold_time / self.hold_time_required)
@@ -1339,20 +2286,8 @@ class SquatExercise:
                 cv2.putText(frame, timer_text, (position[0], y_offset),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, timer_color, 2)  # Larger font
                            
-            # Show statistics - larger font and more spaced out
-            y_offset = position[1] + 210
-            total_squats = sum(self.completed_squats.values())
-            cv2.putText(frame, f"Total Squats: {total_squats}", 
-                       (position[0], y_offset),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
-            
-            y_offset += 30
-            level_stats = f"L1:{self.completed_squats[1]} L2:{self.completed_squats[2]} L3:{self.completed_squats[3]}"
-            cv2.putText(frame, level_stats, (position[0], y_offset),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
-                       
             # Safety reminder for elderly
-            y_offset += 40
+            y_offset = position[1] + 180
             safety_tip = "Remember: Go at your own pace"
             cv2.putText(frame, safety_tip, (position[0], y_offset),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (170, 230, 255), 1)
@@ -1365,112 +2300,131 @@ class SquatExercise:
 # 7) Main
 # ------------------------------
 def main():
-    try:
-        # Tkinter popup with larger text and simpler instructions for elderly users
+    # Ensure necessary data files are available
+    predictor_path = "shape_predictor_68_face_landmarks.dat"
+    
+    # Check if facial landmark predictor file exists
+    if not os.path.exists(predictor_path):
+        # Show popup with download instructions
         root = tk.Tk()
-        root.withdraw()
+        root.withdraw()  # Hide the main window
         
-        # More readable instructions with larger font
-        root.option_add('*Font', 'Arial 12')
+        message = (
+            "The facial landmark predictor file is needed for safety monitoring.\n\n"
+            "Please download it from:\n"
+            "http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2\n\n"
+            "Extract the file to the same folder as this program.\n"
+            "The program will continue, but facial safety monitoring will be limited."
+        )
         
-        messagebox.showinfo("Physiotherapy Exercise Program", 
-                          "Elderly-Friendly Exercise Program\n\n" +
-                          "This program will guide you through various exercises:\n" +
-                          "• Arm Raising - Gentle shoulder mobility\n" +
-                          "• Side Stretches - Improve lateral flexibility\n" +
-                          "• Chair Squats - Build leg strength\n\n" +
-                          "CONTROLS:\n" +
-                          "Press 1 - Arm Raising Exercise\n" +
-                          "Press 2 - Side Stretch Exercise\n" +
-                          "Press 3 - Chair Squat Exercise\n" +
-                          "Press R - Restart current exercise\n" +
-                          "Press Q - Quit program\n\n" +
-                          "SAFETY TIPS:\n" +
-                          "• Go at your own pace\n" +
-                          "• Stop if you feel pain\n" +
-                          "• Use a chair for support if needed")
-        root.destroy()
-
-        # Initialize game components
-        pose_estimator = YoloPoseEstimator(model_path='yolov8n-pose.pt', conf=0.45)
-        game_manager = GameManager(num_players=2)
-
-        # Camera setup
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            print("Could not open camera.")
-            return
-
-        # Lower resolution for better performance but still readable for elderly
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1024)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 768)
-
-        # Frame limiting - lower fps for more stable processing
-        target_fps = 24
-        frame_interval = 1.0 / target_fps
-        prev_time = time.time()
-
-        # Set initial window size larger for better visibility
-        cv2.namedWindow("Physiotherapy Exercise Program", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Physiotherapy Exercise Program", 1024, 768)
-
-        while True:
-            # Frame rate control
-            current_time = time.time()
-            elapsed = current_time - prev_time
-            if elapsed < frame_interval:
-                continue
-            prev_time = current_time
-
-            # Read frame
-            ret, frame = cap.read()
-            if not ret:
-                print("Failed to grab frame.")
-                break
-
-            # Pose detection
-            keypoints_list = pose_estimator.estimate_pose(frame)
-
-            # Get player colors for skeleton drawing
-            player_colors = [p.color for p in game_manager.players]
-            
-            # Draw skeleton with player-specific colors
-            pose_estimator.draw_skeleton(frame, keypoints_list, player_colors)
-
-            # Process game logic
-            game_manager.process_frame(frame, keypoints_list)
-            
-            # Animate floating text
-            game_manager.attack_exercise.draw_messages(frame)
-
-            # Display the frame
-            cv2.imshow("Physiotherapy Exercise Program", frame)
-            
-            # Handle keyboard input - check with waitKey for longer duration for elderly users
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
-            elif key == ord('r'):
-                game_manager.restart_game()
-            elif key == ord('1'):
-                print("Switching to Arm Raising exercise")
-                game_manager.switch_exercise('attack')
-            elif key == ord('2'):
-                print("Switching to Side Stretch exercise")
-                game_manager.switch_exercise('side_stretch')
-            elif key == ord('3'):
-                print("Switching to Chair Squat exercise")
-                game_manager.switch_exercise('squat')
-
+        messagebox.showinfo("Download Required", message)
+    
+    # Create a large popup message with clear instructions
+    root = tk.Tk()
+    root.withdraw()  # Hide the main window
+    
+    # Detailed message for elderly users with clear instructions
+    welcome_message = (
+        "🏋️‍♀️ Physiotherapy Exercise Program 🏋️‍♀️\n\n"
+        "Welcome to your exercise session!\n\n"
+        "This program offers three exercises:\n"
+        "1. Arm Raising (Buddha Clap) - Raise your arms to attack\n"
+        "2. Side Stretch - Stretch to the side to heal yourself\n"
+        "3. Chair Squat - Perform gentle squats to heal yourself\n\n"
+        "Controls:\n"
+        "- Press 1 for Arm Raising exercise\n"
+        "- Press 2 for Side Stretch exercise\n"
+        "- Press 3 for Chair Squat exercise\n"
+        "- Press R to reset the session\n"
+        "- Press Q to quit the program\n\n"
+        "Safety First:\n"
+        "• Go at your own pace\n"
+        "• Stop if you feel any pain\n"
+        "• The program will monitor your facial expressions for safety\n\n"
+        "The enhanced interface includes:\n"
+        "• Player 1: Minecraft-style health hearts\n"
+        "• Player 2: Traditional health bar with visual effects\n"
+        "• Animated health changes and feedback\n\n"
+        "Enjoy your exercise session!"
+    )
+    
+    messagebox.showinfo("Physiotherapy Exercise Program", welcome_message)
+    
+    # Initialize camera capture
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1024)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 768)
+    
+    # Set target frame rate for more stable processing
+    target_fps = 24
+    
+    # Initialize skeletal detection model
+    try:
+        model = YOLO('yolov8n-pose.pt')
     except Exception as e:
-        print(f"Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        print("Closing program and releasing resources...")
-        if 'cap' in locals() and cap is not None:
-            cap.release()
+        print(f"Error loading YOLO model: {e}")
+        messagebox.showerror("Error", "Failed to load YOLO model. Please check installation.")
+        cap.release()
         cv2.destroyAllWindows()
+        return
+    
+    # Initialize game manager
+    game_manager = GameManager(num_players=2)
+    
+    # Processing loop
+    while True:
+        # Timer to maintain consistent frame rate
+        start_time = time.time()
+        
+        # Capture frame
+        ret, frame = cap.read()
+        if not ret:
+            print("Error: Could not read frame.")
+            break
+            
+        # Flip frame for mirror effect
+        frame = cv2.flip(frame, 1)
+        
+        # Run detection model
+        results = model.predict(frame, verbose=False)
+        
+        # Get keypoints
+        keypoints_list = []
+        for result in results:
+            keypoints = result.keypoints.xy.cpu().numpy()
+            if len(keypoints) > 0:
+                keypoints_list.append(keypoints[0])
+        
+        # Update game state with keypoints
+        game_manager.process_frame(frame, keypoints_list)
+        
+        # Display frame
+        cv2.imshow('Physiotherapy Exercise', frame)
+        
+        # Check for keyboard input
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord('q'):
+            break
+        elif key == ord('r'):
+            game_manager.restart_game()
+        # Switch between exercises
+        elif key == ord('1'):
+            game_manager.switch_exercise('attack')
+        elif key == ord('2'):
+            game_manager.switch_exercise('side_stretch')
+        elif key == ord('3'):
+            game_manager.switch_exercise('squat')
+            
+        # Calculate delay to maintain target FPS
+        elapsed = time.time() - start_time
+        sleep_time = max(1.0/target_fps - elapsed, 0)
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+            
+    # Clean up
+    cap.release()
+    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
